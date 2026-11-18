@@ -26,11 +26,10 @@ stages:
         python -m build
       displayName: Test and build library
     - script: |
-        twine upload --skip-existing \
+        twine upload \
           --repository-url https://$(JFROG_URL)/artifactory/api/pypi/pypl-local \
           -u $(JFROG_USER) -p $(JFROG_TOKEN) common/dist/*
       displayName: PUSH shop-common wheel to JFrog
-
 # 2) Build both services; each PULLS the library from JFrog
 - stage: Services
   dependsOn: Library
