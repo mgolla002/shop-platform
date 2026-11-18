@@ -1,0 +1,98 @@
+trigger:
+  branches:
+    include: [ main ]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: jfrog-vars
+  - name: tag
+    value: $(Build.BuildId)
+
+stages:
+# 1) Build the shared library and PUSH it to JFrog
+- stage: Library
+  jobs:
+  - job: BuildLibrary
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+    - script: |
+        pip install pytest build twine
+        cd common
+        pytest -q
+        python -m build
+      displayName: Test and build library
+    - script: |
+        twine upload --skip-existing \
+          --repository-url https://$(JFROG_URL)/artifactory/api/pypi/pypl-local \
+          -u $(JFROG_USER) -p $(JFROG_TOKEN) common/dist/*
+      displayName: PUSH shop-common wheel to JFrog
+
+# 2) Build both services; each PULLS the library from JFrog
+- stage: Services
+  dependsOn: Library
+  jobs:
+  - job: BuildService
+    strategy:
+      matrix:
+        orders:
+          svc: orders
+        inventory:
+          svc: inventory
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+    - script: |
+        ENC_USER=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$(JFROG_USER)")
+        mkdir -p $(svc)/wheels
+        pip download shop-common --no-deps -d $(svc)/wheels \
+          --index-url "https://${ENC_USER}:$(JFROG_TOKEN)@$(JFROG_URL)/artifactory/api/pypi/pypl-local/simple"
+        ls -l $(svc)/wheels
+      displayName: PULL shop-common from JFrog
+    - script: |
+        pip install pytest -r $(svc)/requirements.txt $(svc)/wheels/*.whl
+        cd $(svc)
+        pytest -q
+      displayName: Test service
+    - script: |
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        docker build -t $(JFROG_URL)/docker-trial/shop-$(svc):$(tag) $(svc)
+        docker push $(JFROG_URL)/docker-trial/shop-$(svc):$(tag)
+      displayName: PUSH image to JFrog
+
+# 3) Run both containers together
+- stage: IntegrationTest
+  dependsOn: Services
+  jobs:
+  - job: Integration
+    steps:
+    - script: |
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        docker network create shop
+        docker run -d --network shop --name inventory $(JFROG_URL)/docker-trial/shop-inventory:$(tag)
+        docker run -d --network shop --name orders -e INVENTORY_URL=http://inventory:8000 \
+          -p 8000:8000 $(JFROG_URL)/docker-trial/shop-orders:$(tag)
+        curl -sf --retry 10 --retry-delay 2 --retry-connrefused http://localhost:8000/order/laptop/1 | tee result.json
+        grep 974.25 result.json
+        docker logs orders
+      displayName: Orders calls Inventory
+
+# 4) Promote only tested images
+- stage: Promote
+  dependsOn: IntegrationTest
+  condition: succeeded()
+  jobs:
+  - job: Promote
+    steps:
+    - script: |
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        for s in orders inventory; do
+          docker pull $(JFROG_URL)/docker-trial/shop-$s:$(tag)
+          docker tag  $(JFROG_URL)/docker-trial/shop-$s:$(tag) $(JFROG_URL)/docker-trial/shop-$s:stable
+          docker push $(JFROG_URL)/docker-trial/shop-$s:stable
+        done
+      displayName: Promote to stable

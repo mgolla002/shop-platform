@@ -1,0 +1,21 @@
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: jfrog-vars
+
+steps:
+- script: |
+    echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+    docker pull $(JFROG_URL)/docker-trial/shop-inventory:stable
+    docker pull $(JFROG_URL)/docker-trial/shop-orders:stable
+    docker network create shop
+    docker run -d --network shop --name inventory $(JFROG_URL)/docker-trial/shop-inventory:stable
+    docker run -d --network shop --name orders -e INVENTORY_URL=http://inventory:8000 \
+      -p 8000:8000 $(JFROG_URL)/docker-trial/shop-orders:stable
+    curl -sf --retry 10 --retry-delay 2 --retry-connrefused http://localhost:8000/order/mouse/10
+    echo
+    curl -s http://localhost:8000/order/laptop/9
+  displayName: PULL stable images and run them
